@@ -185,8 +185,9 @@ save_last() {
       channel_id: $channel_id, channel: $channel}' > "$STATE"
 }
 
+# Title of the last played stream; fails (without exiting) if nothing has been played.
 current_title() {
-  [[ -f "$STATE" ]] || die "nothing has been played yet"
+  [[ -f "$STATE" ]] || return 1
   jq -r '.title' "$STATE"
 }
 
@@ -207,7 +208,8 @@ cmd_start() {
   require mpv yt-dlp
   if [[ -z "${1:-}" ]] && running; then
     ipc '{"command":["set_property","pause",false]}' >/dev/null
-    echo "playing $(current_title)"; return
+    local title; title=$(current_title || get_prop media-title)
+    echo "playing $title"; return
   fi
 
   local stream id title channel_id channel url
@@ -230,6 +232,8 @@ cmd_start() {
 
 cmd_play() {
   require mpv yt-dlp
+  # A second mpv would take over the socket, leaving the first one playing and uncontrollable.
+  running && die "already playing (use: lofi stop, or lofi start [what] to switch streams)"
   local stream id title channel_id channel
   stream=$(choose_stream "${1:-}")
   IFS=$'\t' read -r id title channel_id channel <<< "$stream"
@@ -357,13 +361,13 @@ cmd_favorite() {
       jq -r '.favorites[]' "$CONFIG"
       ;;
     add)
-      if [[ -n "${1:-}" ]]; then title=$(find_stream "$1" | cut -f2); else title=$(current_title); fi
+      if [[ -n "${1:-}" ]]; then title=$(find_stream "$1" | cut -f2); else title=$(current_title) || die "nothing has been played yet"; fi
       config_edit '.favorites |= if any(.[]; . == $t) then . else . + [$t] end' --arg t "$title"
       echo "★ $title"
       ;;
     remove)
       if [[ -z "${1:-}" ]]; then
-        title=$(current_title)
+        title=$(current_title) || die "nothing has been played yet"
       elif [[ "$1" =~ ^https?:// || "$1" =~ ^[0-9]+$ ]]; then
         title=$(find_stream "$1" | cut -f2)
       else
