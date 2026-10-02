@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+# lofi — stream the audio of YouTube live streams in the background.
+#
+# mpv does the playback (resolving YouTube URLs through yt-dlp); this script
+# starts it with a JSON IPC socket, sends commands to that socket, and keeps
+# your channels and favorite streams in a config file.
+#
+# Usage:
+#   lofi list                    live streams from your channels, favorites first
+#   lofi start [what]            play in the background; no [what] resumes the last stream
+#   lofi play  [what]            play in the foreground (space = pause, 9/0 = volume, q = quit)
+#                                [what] is a stream URL, a number from `lofi list`, or a word from a title
+#   lofi toggle | pause | resume
+#   lofi vol [+N|-N|N]           adjust or set volume (no arg prints current volume)
+#   lofi status                  one-line JSON status (for Waybar custom modules)
+#   lofi stop
+#
+#   lofi channels                list your channels
+#   lofi add <channel>           add a channel by URL, @handle, or the URL of one of its streams
+#   lofi remove <channel>        remove a channel by number, name, URL, or @handle
+#
+#   lofi favorite [list]         list favorite streams
+#   lofi favorite add [what]     favorite a stream (default: the current one)
+#   lofi favorite remove [what]  unfavorite a stream (default: the current one)
+
+set -euo pipefail
+
+CONFIG="${LOFI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/lofi/config.json}"
+STATE="${LOFI_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/lofi/last.json}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+SOCKET="${LOFI_SOCKET:-${RUNTIME_DIR%/}/lofi-player.sock}"
+
+# Channels every new config starts with. Removing one only hides it, so it
+# can be brought back with `lofi add <name>`.
+DEFAULT_CHANNELS='[
+  {"name": "Lofi Girl", "id": "UCSJ4gkVC6NrvII8umztf0Ow", "handle": "@LofiGirl", "hidden": false}
+]'
+
+MPV_ARGS=(
+  --no-video
+  --ytdl-format=bestaudio/best
+  --input-ipc-server="$SOCKET"
+  --title=lofi-player
+  --volume="${LOFI_VOLUME:-60}"
+  --cache=yes
+)
+
+die() { echo "lofi: $*" >&2; exit 1; }
+
+require() {
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null || die "missing dependency: $cmd"
+  done
+}
+
+# --- mpv ---------------------------------------------------------------------
+
+# Send one JSON IPC command and print mpv's reply.
+ipc() {
+  [[ -S "$SOCKET" ]] || return 1
+  if command -v socat >/dev/null; then
+    printf '%s\n' "$1" | socat - "UNIX-CONNECT:$SOCKET" 2>/dev/null
+  elif command -v python3 >/dev/null; then
+    python3 - "$SOCKET" "$1" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.sendall(sys.argv[2].encode() + b"\n")
+print(s.makefile().readline(), end="")
+PY
+  else
+    die "need socat or python3 to talk to mpv"
+  fi
+}
+
+running() { ipc '{"command":["get_property","pid"]}' >/dev/null 2>&1; }
+
+get_prop() {
+  ipc "{\"command\":[\"get_property\",\"$1\"]}" | jq -r 'select(.error=="success") | .data'
+}
+
+# --- config ------------------------------------------------------------------
+
+ensure_config() {
+  [[ -f "$CONFIG" ]] && return
+  mkdir -p "$(dirname "$CONFIG")"
+  jq -n --argjson defaults "$DEFAULT_CHANNELS" \
+    '{default_channels: $defaults, channels: [], favorites: []}' > "$CONFIG"
+}
+
+# Rewrite the config through a jq filter: config_edit FILTER [jq args...]
+config_edit() {
+  local filter=$1; shift
+  jq "$@" "$filter" "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+}
+
+# "channel id<TAB>name<TAB>@handle" for each channel that isn't hidden, defaults first.
+channels() {
+  ensure_config
+  jq -r '[(.default_channels[] | select(.hidden | not)), .channels[]][]
+         | [.id, .name, .handle // ""] | @tsv' "$CONFIG"
+}
+
+# --- streams -----------------------------------------------------------------
+
+# "video id<TAB>title" for each stream a channel has live right now.
+live_streams() {
+  yt-dlp --flat-playlist -J "https://www.youtube.com/channel/$1/streams" 2>/dev/null |
+    jq -r '.entries[]? | select(.live_status == "is_live") | [.id, .title] | @tsv' || true
+}
+
+# Every live stream across your channels, favorites first, one per line:
+# "favorite (1/0)<TAB>video id<TAB>title<TAB>channel name<TAB>channel id"
+all_streams() {
+  require yt-dlp
+  local tmp n=0 id name handle i
+  tmp=$(mktemp -d)
+  # Fetch channels in parallel; each takes about a second.
+  while IFS=$'\t' read -r id name handle; do
+    n=$((n + 1))
+    live_streams "$id" |
+      awk -F '\t' -v OFS='\t' -v name="$name" -v id="$id" '{ print $1, $2, name, id }' > "$tmp/$n" &
+  done < <(channels)
+  wait
+  jq -r '.favorites[]' "$CONFIG" > "$tmp/favorites"
+  for ((i = 1; i <= n; i++)); do cat "$tmp/$i"; done |
+    awk -F '\t' -v OFS='\t' -v favs="$tmp/favorites" '
+      BEGIN { while ((getline line < favs) > 0) fav[line] = 1 }
+      { row[NR] = $0; isfav[NR] = ($2 in fav) }
+      END {
+        for (i = 1; i <= NR; i++) if (isfav[i]) print 1, row[i]
+        for (i = 1; i <= NR; i++) if (!isfav[i]) print 0, row[i]
+      }'
+  rm -rf "$tmp"
+}
+
+# Find a stream from a URL, a number from `lofi list`, or text from a title.
+# Prints "video id<TAB>title<TAB>channel id<TAB>channel name".
+find_stream() {
+  local what=$1 row
+  if [[ "$what" =~ ^https?:// ]]; then
+    row=$(yt-dlp -J --skip-download --no-playlist "$what" 2>/dev/null |
+      jq -r 'select(.fulltitle) | [.id, .fulltitle, .channel_id, .channel] | @tsv' || true)
+    [[ -n "$row" ]] || die "couldn't find a stream at $what"
+  else
+    row=$(all_streams | awk -F '\t' -v OFS='\t' -v q="$what" '
+      (q ~ /^[0-9]+$/ ? NR == q : index(tolower($3), tolower(q))) { print $2, $3, $5, $4; exit }')
+    [[ -n "$row" ]] || die "no live stream matches '$what' (see: lofi list)"
+  fi
+  echo "$row"
+}
+
+# The last played stream, found again by title if its URL is no longer live.
+# Prints "video id<TAB>title<TAB>channel id<TAB>channel name".
+last_stream() {
+  local id title channel_id channel match
+  IFS=$'\t' read -r id title channel_id channel < <(jq -r '[.id, .title, .channel_id, .channel] | @tsv' "$STATE")
+  match=$(live_streams "$channel_id" | awk -F '\t' -v id="$id" -v title="$title" '
+    $1 == id { print $1; found = 1; exit }
+    $2 == title && !alt { alt = $1 }
+    END { if (!found && alt) print alt }')
+  [[ -n "$match" ]] || die "'$title' is no longer live on $channel (see: lofi list)"
+  [[ "$match" == "$id" ]] || echo "'$title' moved to a new URL; following it" >&2
+  printf '%s\t%s\t%s\t%s\n' "$match" "$title" "$channel_id" "$channel"
+}
+
+# What start/play should play: the given stream, else the last one, else the top of `lofi list`.
+choose_stream() {
+  local stream
+  if [[ -n "${1:-}" ]]; then
+    find_stream "$1"
+  elif [[ -f "$STATE" ]]; then
+    last_stream
+  else
+    stream=$(all_streams | awk -F '\t' -v OFS='\t' 'NR == 1 { print $2, $3, $5, $4 }')
+    [[ -n "$stream" ]] || die "none of your channels are live right now (see: lofi channels)"
+    echo "$stream"
+  fi
+}
+
+save_last() {
+  mkdir -p "$(dirname "$STATE")"
+  jq -n --arg id "$1" --arg title "$2" --arg channel_id "$3" --arg channel "$4" \
+    '{url: "https://www.youtube.com/watch?v=\($id)", id: $id, title: $title,
+      channel_id: $channel_id, channel: $channel}' > "$STATE"
+}
+
+current_title() {
+  [[ -f "$STATE" ]] || die "nothing has been played yet"
+  jq -r '.title' "$STATE"
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_list() {
+  local rows
+  rows=$(all_streams)
+  [[ -n "$rows" ]] || die "none of your channels are live right now (see: lofi channels)"
+  awk -F '\t' '{
+    section = $1 ? "Favorites" : $4
+    if (section != last) { printf "%s%s\n", (NR > 1 ? "\n" : ""), section; last = section }
+    printf "%3d  %s%s\n", NR, $3, ($1 ? "  · " $4 : "")
+  }' <<< "$rows"
+}
+
+cmd_start() {
+  require mpv yt-dlp
+  if [[ -z "${1:-}" ]] && running; then
+    ipc '{"command":["set_property","pause",false]}' >/dev/null
+    echo "playing $(current_title)"; return
+  fi
+
+  local stream id title channel_id channel url
+  stream=$(choose_stream "${1:-}")
+  IFS=$'\t' read -r id title channel_id channel <<< "$stream"
+  url="https://www.youtube.com/watch?v=$id"
+  save_last "$id" "$title" "$channel_id" "$channel"
+
+  if running; then
+    ipc "{\"command\":[\"loadfile\",\"$url\",\"replace\"]}" >/dev/null
+    ipc '{"command":["set_property","pause",false]}' >/dev/null
+    echo "switched to $title"; return
+  fi
+  rm -f "$SOCKET"
+  nohup mpv "${MPV_ARGS[@]}" "$url" >/dev/null 2>&1 &
+  # Wait for the socket so follow-up commands work immediately.
+  for _ in $(seq 50); do running && { echo "playing $title"; return; }; sleep 0.1; done
+  die "mpv did not start"
+}
+
+cmd_play() {
+  require mpv yt-dlp
+  local stream id title channel_id channel
+  stream=$(choose_stream "${1:-}")
+  IFS=$'\t' read -r id title channel_id channel <<< "$stream"
+  save_last "$id" "$title" "$channel_id" "$channel"
+  exec mpv "${MPV_ARGS[@]}" "https://www.youtube.com/watch?v=$id"
+}
+
+cmd_vol() {
+  case "${1:-}" in
+    "")    ;;
+    +*|-*) ipc "{\"command\":[\"add\",\"volume\",${1#+}]}" >/dev/null ;;
+    *)     ipc "{\"command\":[\"set_property\",\"volume\",${1}]}" >/dev/null ;;
+  esac
+  local volume; volume=$(get_prop volume); echo "${volume%.*}"
+}
+
+cmd_status() {
+  if ! running; then
+    jq -cn '{text:"", class:"stopped", tooltip:"lofi: stopped"}'
+    return
+  fi
+  local paused volume title
+  paused=$(get_prop pause)
+  volume=$(get_prop volume)
+  title=$(current_title 2>/dev/null || get_prop media-title)
+  jq -cn --arg paused "$paused" --arg vol "${volume%.*}" --arg title "$title" '{
+    text: ((if $paused == "true" then "⏸" else "▶" end) + " " + $vol + "%"),
+    class: (if $paused == "true" then "paused" else "playing" end),
+    tooltip: $title,
+    percentage: ($vol | tonumber)
+  }'
+}
+
+cmd_channels() {
+  local visible hidden
+  visible=$(channels)
+  if [[ -n "$visible" ]]; then
+    awk -F '\t' '{ printf "%3d  %s%s\n", NR, $2, ($3 == "" ? "" : "  " $3) }' <<< "$visible"
+  else
+    echo "no channels (add one with: lofi add <channel url | @handle>)"
+  fi
+  hidden=$(jq -r '.default_channels[] | select(.hidden) | "     " + .name' "$CONFIG")
+  [[ -z "$hidden" ]] || printf '\nRemoved defaults (restore with: lofi add <name>)\n%s\n' "$hidden"
+}
+
+# Look up a channel on YouTube. Prints "channel id<TAB>name<TAB>@handle".
+lookup_channel() {
+  local url
+  case "$1" in
+    @*)          url="https://www.youtube.com/$1" ;;
+    UC*)         url="https://www.youtube.com/channel/$1" ;;
+    http*://*)   url=$1 ;;
+    *)           return 1 ;;
+  esac
+  # Channel tab URLs (…/streams, …/live) list videos; we want the channel itself.
+  url=$(sed -E 's#/(streams|live|videos|featured|shorts)?/?$##' <<< "$url")
+  yt-dlp -J --flat-playlist --playlist-items 0 --no-playlist "$url" 2>/dev/null |
+    jq -er 'select(.channel_id) | [.channel_id, .channel, .uploader_id // ""] | @tsv'
+}
+
+cmd_add() {
+  ensure_config
+  local what=${1:?usage: lofi add <channel url | @handle | stream url | default name>}
+  local row id name handle
+
+  # A hidden default channel can be restored by name; anything else is looked up.
+  row=$(jq -r --arg q "$what" 'first(.default_channels[]
+          | select((.name | ascii_downcase) == ($q | ascii_downcase))
+          | [.id, .name, .handle] | @tsv) // empty' "$CONFIG")
+  if [[ -z "$row" ]]; then
+    require yt-dlp
+    row=$(lookup_channel "$what") || die "couldn't find a YouTube channel for '$what'"
+  fi
+  IFS=$'\t' read -r id name handle <<< "$row"
+
+  if jq -e --arg id "$id" 'any(.default_channels[]; .id == $id)' "$CONFIG" >/dev/null; then
+    config_edit '(.default_channels[] | select(.id == $id) | .hidden) = false' --arg id "$id"
+    echo "restored default channel: $name"
+  elif jq -e --arg id "$id" 'any(.channels[]; .id == $id)' "$CONFIG" >/dev/null; then
+    echo "already added: $name"
+  else
+    config_edit '.channels += [{name: $name, id: $id, handle: $handle}]' \
+      --arg name "$name" --arg id "$id" --arg handle "$handle"
+    echo "added $name"
+  fi
+}
+
+cmd_remove() {
+  ensure_config
+  local what=${1:?usage: lofi remove <number | name | url | @handle>} q id name
+
+  if [[ "$what" =~ ^[0-9]+$ ]]; then
+    id=$(channels | awk -F '\t' -v n="$what" 'NR == n { print $1 }')
+  else
+    q=$what
+    if [[ "$what" =~ (@[^/?]+) ]]; then q=${BASH_REMATCH[1]}
+    elif [[ "$what" =~ channel/(UC[A-Za-z0-9_-]+) ]]; then q=${BASH_REMATCH[1]}
+    fi
+    # Exact id/name/handle match wins; otherwise the first name containing q.
+    id=$(channels | awk -F '\t' -v q="$q" '
+      BEGIN { q = tolower(q) }
+      tolower($1) == q || tolower($2) == q || tolower($3) == q { print $1; found = 1; exit }
+      !partial && index(tolower($2), q) { partial = $1 }
+      END { if (!found && partial) print partial }')
+  fi
+  [[ -n "$id" ]] || die "no channel matches '$what' (see: lofi channels)"
+  name=$(channels | awk -F '\t' -v id="$id" '$1 == id { print $2 }')
+
+  if jq -e --arg id "$id" 'any(.default_channels[]; .id == $id)' "$CONFIG" >/dev/null; then
+    config_edit '(.default_channels[] | select(.id == $id) | .hidden) = true' --arg id "$id"
+    echo "removed $name (it's a default; restore with: lofi add \"$name\")"
+  else
+    config_edit 'del(.channels[] | select(.id == $id))' --arg id "$id"
+    echo "removed $name"
+  fi
+}
+
+cmd_favorite() {
+  ensure_config
+  local action=${1:-list} title
+  shift || true
+
+  case "$action" in
+    list)
+      jq -r '.favorites[]' "$CONFIG"
+      ;;
+    add)
+      if [[ -n "${1:-}" ]]; then title=$(find_stream "$1" | cut -f2); else title=$(current_title); fi
+      config_edit '.favorites |= if any(.[]; . == $t) then . else . + [$t] end' --arg t "$title"
+      echo "★ $title"
+      ;;
+    remove)
+      if [[ -z "${1:-}" ]]; then
+        title=$(current_title)
+      elif [[ "$1" =~ ^https?:// || "$1" =~ ^[0-9]+$ ]]; then
+        title=$(find_stream "$1" | cut -f2)
+      else
+        # Match against saved favorites, so ones that aren't live can still be removed.
+        title=$(jq -r --arg q "$1" 'first(.favorites[]
+                  | select(ascii_downcase | contains($q | ascii_downcase))) // empty' "$CONFIG")
+      fi
+      [[ -n "$title" ]] && jq -e --arg t "$title" 'any(.favorites[]; . == $t)' "$CONFIG" >/dev/null ||
+        die "not a favorite: ${title:-$1}"
+      config_edit 'del(.favorites[] | select(. == $t))' --arg t "$title"
+      echo "removed favorite: $title"
+      ;;
+    *)
+      die "usage: lofi favorite [list | add [what] | remove [what]]"
+      ;;
+  esac
+}
+
+require jq
+case "${1:-}" in
+  list)         cmd_list ;;
+  start)        shift; cmd_start "$@" ;;
+  play)         shift; cmd_play "$@" ;;
+  toggle)       ipc '{"command":["cycle","pause"]}' >/dev/null || die "not running" ;;
+  pause)        ipc '{"command":["set_property","pause",true]}' >/dev/null || die "not running" ;;
+  resume)       ipc '{"command":["set_property","pause",false]}' >/dev/null || die "not running" ;;
+  vol)          shift; running || die "not running"; cmd_vol "$@" ;;
+  status)       cmd_status ;;
+  stop)         ipc '{"command":["quit"]}' >/dev/null || true; rm -f "$SOCKET" ;;
+  channels)     cmd_channels ;;
+  add)          shift; cmd_add "$@" ;;
+  remove)       shift; cmd_remove "$@" ;;
+  favorite|fav) shift; cmd_favorite "$@" ;;
+  *)            sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 1 ;;
+esac
