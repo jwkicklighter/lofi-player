@@ -14,6 +14,7 @@
 #   lofi vol [+N|-N|N]           adjust or set volume (no arg prints current volume)
 #   lofi status                  one-line JSON status (for Waybar custom modules)
 #   lofi stop
+#   lofi update                  download the latest stable GitHub release
 #
 #   lofi channels                list your channels
 #   lofi add <channel>           add a channel by URL, @handle, or the URL of one of its streams
@@ -385,6 +386,42 @@ cmd_favorite() {
       ;;
   esac
 }
+
+cmd_update() (
+  require curl
+  local target=${BASH_SOURCE[0]} dir download link
+  # Resolve links without readlink -f, which isn't available on stock macOS.
+  [[ "$target" == */* ]] || target=$(command -v "$target")
+  while :; do
+    dir=$(cd -P -- "$(dirname "$target")" && pwd)
+    target="$dir/$(basename "$target")"
+    [[ -L "$target" ]] || break
+    link=$(readlink "$target")
+    case "$link" in
+      /*) target=$link ;;
+      *) target="$dir/$link" ;;
+    esac
+  done
+  [[ -w "$dir" && -w "$target" ]] || die "cannot update $target: install lofi in a user-writable directory"
+
+  download=$(mktemp "$dir/.lofi-update.XXXXXX")
+  trap 'rm -f -- "$download"' EXIT
+  curl -fsSL --retry 3 --connect-timeout 15 \
+    https://github.com/jwkicklighter/lofi-player/releases/latest/download/lofi \
+    -o "$download" || die "download failed; existing script unchanged"
+  [[ -s "$download" ]] || die "downloaded script is empty"
+  [[ "$(head -n 1 "$download")" == '#!/usr/bin/env bash' ]] || die "download is not a Bash script"
+  bash -n "$download" || die "downloaded script failed syntax validation"
+  chmod 755 "$download"
+  mv -f -- "$download" "$target"
+  printf 'Updated lofi at %s\n' "$target"
+)
+
+# Updating doesn't need playback dependencies or touch config/state.
+if [[ "${1:-}" == update ]]; then
+  cmd_update
+  exit
+fi
 
 require jq
 case "${1:-}" in

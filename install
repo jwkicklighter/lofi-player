@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Define everything before running it so bash never executes a partial download.
+(
+set -euo pipefail
+
+die() { printf 'lofi installer: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Install lofi and its dependencies (macOS, Arch Linux, Ubuntu).
+
+Options:
+  --no-modify-path  Don't update shell configuration
+  -h, --help       Show this help
+
+Environment:
+  LOFI_INSTALL_DIR  Destination directory (default: ~/.local/bin)
+
+macOS requires Homebrew: https://brew.sh
+Run as your regular user; sudo is used only for Linux packages.
+EOF
+}
+
+as_root() {
+  if [[ "$EUID" -eq 0 ]]; then
+    "$@" </dev/null
+  else
+    command -v sudo >/dev/null || die "sudo is required to install dependencies"
+    sudo "$@" </dev/null
+  fi
+}
+
+main() {
+  local no_modify_path=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-modify-path) no_modify_path=true ;;
+      -h|--help) usage; return ;;
+      *) die "unknown option: $1 (see --help)" ;;
+    esac
+    shift
+  done
+
+  local install_dir=${LOFI_INSTALL_DIR:-$HOME/.local/bin}
+  [[ "$install_dir" == /* ]] || die "LOFI_INSTALL_DIR must be an absolute path"
+
+  local platform ID='' ID_LIKE=''
+  case "$(uname -s)" in
+    Darwin) platform=macos ;;
+    Linux)
+      [[ -r /etc/os-release ]] || die "cannot identify Linux distribution"
+      . /etc/os-release
+      case " $ID $ID_LIKE " in
+        *' arch '*) platform=arch ;;
+        *' ubuntu '*) platform=ubuntu ;;
+        *) die "unsupported Linux distribution: $ID (supported: Arch Linux, Ubuntu)" ;;
+      esac
+      ;;
+    *) die "unsupported OS (supported: macOS, Arch Linux, Ubuntu)" ;;
+  esac
+
+  local cmd missing=()
+  for cmd in mpv yt-dlp socat jq curl; do
+    command -v "$cmd" >/dev/null || missing+=("$cmd")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    printf 'Installing dependencies: %s\n' "${missing[*]}"
+    case "$platform" in
+      macos)
+        command -v brew >/dev/null || die "install Homebrew from https://brew.sh, then run this installer again"
+        brew install "${missing[@]}" </dev/null
+        ;;
+      arch)
+        # Full upgrade avoids unsupported Arch partial upgrades.
+        as_root pacman -Syu --needed --noconfirm "${missing[@]}"
+        ;;
+      ubuntu)
+        as_root apt-get update
+        as_root apt-get install -y "${missing[@]}"
+        ;;
+    esac
+  fi
+  for cmd in mpv yt-dlp socat jq curl; do
+    command -v "$cmd" >/dev/null || die "dependency not found after installation: $cmd"
+  done
+
+  mkdir -p "$install_dir"
+  # Stage beside the destination so replacement is atomic, even on updates.
+  local download
+  download=$(mktemp "$install_dir/.lofi-install.XXXXXX")
+  trap 'rm -f -- "$download"' EXIT
+  curl -fsSL --retry 3 --connect-timeout 15 \
+    https://github.com/jwkicklighter/lofi-player/releases/latest/download/lofi \
+    -o "$download"
+  [[ -s "$download" ]] || die "downloaded script is empty"
+  [[ "$(head -n 1 "$download")" == '#!/usr/bin/env bash' ]] || die "download is not a Bash script"
+  bash -n "$download" || die "downloaded script failed syntax validation"
+  chmod 755 "$download"
+  mv -f -- "$download" "$install_dir/lofi"
+  trap - EXIT
+  printf 'Installed lofi to %s/lofi\n' "$install_dir"
+
+  if [[ ":$PATH:" != *":$install_dir:"* ]]; then
+    local config='' path_command quoted_dir
+    # Single quotes work in bash, zsh and fish, including paths with spaces.
+    quoted_dir="'${install_dir//\'/\'\\\'\'}'"
+    case "${SHELL:-}" in
+      */zsh) config="${ZDOTDIR:-$HOME}/.zshrc" ;;
+      */bash)
+        if [[ "$platform" == macos ]]; then
+          config="$HOME/.bash_profile"
+        else
+          config="$HOME/.bashrc"
+        fi
+        ;;
+      */fish) config="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish" ;;
+    esac
+    path_command="export PATH=$quoted_dir:\$PATH"
+    if [[ "${SHELL:-}" == */fish ]]; then
+      path_command="fish_add_path -- $quoted_dir"
+    fi
+    if [[ "$no_modify_path" == false && -n "$config" ]]; then
+      mkdir -p "$(dirname "$config")"
+      if ! grep -Fqx -- "$path_command" "$config" 2>/dev/null; then
+        printf '\n# lofi-player\n%s\n' "$path_command" >> "$config"
+      fi
+      printf 'PATH configured in %s. Open a new terminal to use lofi.\n' "$config"
+    else
+      printf 'Add this directory to your PATH:\n  %s\n' "$path_command"
+    fi
+  fi
+  printf 'Get started: lofi list, then lofi start\n'
+}
+
+main "$@"
+)

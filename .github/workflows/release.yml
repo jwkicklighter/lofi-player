@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: bash -n lofi install
+      - name: Run tests
+        run: python3 -m unittest discover -s tests
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "Expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-prerelease" >&2
+            exit 1
+          fi
+          flags=()
+          if [[ "$TAG" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          # Keep the release hidden until both assets have been uploaded.
+          gh release create "$TAG" lofi install \
+            --verify-tag --draft --generate-notes --title "$TAG" "${flags[@]}"
+          gh release edit "$TAG" --draft=false "${flags[@]}"
