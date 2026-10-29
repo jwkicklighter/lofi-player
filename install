@@ -101,9 +101,10 @@ main() {
   printf 'Installed lofi to %s/lofi\n' "$install_dir"
 
   if [[ ":$PATH:" != *":$install_dir:"* ]]; then
-    local config='' path_command quoted_dir
+    local config='' path_command quoted_dir escaped_quote="'\\''"
     # Single quotes work in bash, zsh and fish, including paths with spaces.
-    quoted_dir="'${install_dir//\'/\'\\\'\'}'"
+    # Keep the replacement in a variable: Bash 3.2 parses inline quoting differently.
+    quoted_dir="'${install_dir//\'/$escaped_quote}'"
     case "${SHELL:-}" in
       */zsh) config="${ZDOTDIR:-$HOME}/.zshrc" ;;
       */bash)

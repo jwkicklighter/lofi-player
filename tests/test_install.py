@@ -67,6 +67,7 @@ exit 1
         result = subprocess.run([shutil.which("bash"), "-c",
                                  'source "$HOME/.bash_profile"; command -v lofi'],
                                 env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), str(target))
 
     def test_no_modify_path(self):
